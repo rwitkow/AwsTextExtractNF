@@ -1,0 +1,880 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'getting-started-with-rpa
+
+  This template creates a workflow that leverages AWS Step Functions,  AWS Lambda,
+  and Amazon Textract to get started with Robotic Process  Automation (RPA), which
+  is the use of software with artificial  intelligence (AI) to handle high-volume,
+  repeatable tasks that  previously required humans to perform.
+
+  '
+Globals:
+  Function:
+    Timeout: 3
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Amazon DynamoDB Configuration
+      Parameters:
+      - InvoicesTableNameSuffix
+      - ReadCapacityUnits
+      - WriteCapacityUnits
+    - Label:
+        default: Amazon S3 Bucket Name Prefixes
+      Parameters:
+      - ScannedInvoicesBucketNamePrefix
+      - InvoiceAnalysesBucketNamePrefix
+      - ProcessedInvoicesBucketNamePrefix
+    ParameterLabels:
+      InvoicesTableNameSuffix:
+        default: Invoices Table Name Suffix
+      ReadCapacityUnits:
+        default: Read Capacity Units
+      WriteCapacityUnits:
+        default: Write Capacity Units
+      ScannedInvoicesBucketNamePrefix:
+        default: Scanned Invoices Bucket Name Prefix
+      InvoiceAnalysesBucketNamePrefix:
+        default: Invoice Analyses Bucket Name Prefix
+      ProcessedInvoicesBucketNamePrefix:
+        default: Processed Invoices Bucket Name Prefix
+Parameters:
+  InvoicesTableNameSuffix:
+    Type: String
+    Default: invoices
+    Description: 'The suffix of the name of the Amazon DynamoDB table where processed
+      invoices  will be stored. The table name will be prefixed by the Stack Name.
+
+      '
+  ReadCapacityUnits:
+    Description: Provisioned read throughput
+    Type: Number
+    Default: 5
+    MinValue: 5
+    MaxValue: 10000
+    ConstraintDescription: must be between 5 and 10000
+  WriteCapacityUnits:
+    Description: Provisioned write throughput
+    Type: Number
+    Default: 5
+    MinValue: 5
+    MaxValue: 10000
+    ConstraintDescription: must be between 5 and 10000
+  ScannedInvoicesBucketNamePrefix:
+    Type: String
+    Default: scanned-invoices
+    Description: 'The prefix of the name of the S3 bucket where scanned invoices will
+      be stored.  The bucket name will be suffixed by Account ID to avoid global S3
+      bucket name  collisions.
+
+      '
+  InvoiceAnalysesBucketNamePrefix:
+    Type: String
+    Default: invoice-analyses
+    Description: 'The prefix of the name of the S3 bucket where invoice analyses will
+      be stored. The bucket name will be suffixed by Account ID to avoid global S3
+      bucket name  collisions.
+
+      '
+  ProcessedInvoicesBucketNamePrefix:
+    Type: String
+    Default: processed-invoices
+    Description: 'The prefix of the name of the S3 bucket where processed invoices
+      will be stored.  The bucket name will be suffixed by Account ID to avoid global
+      S3 bucket name  collisions.
+
+      '
+Resources:
+  InvoicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: invoice_id
+        AttributeType: S
+      - AttributeName: payee_name
+        AttributeType: S
+      - AttributeName: due_date
+        AttributeType: S
+      GlobalSecondaryIndexes:
+      - IndexName: payee_name_index
+        KeySchema:
+        - AttributeName: payee_name
+          KeyType: HASH
+        Projection:
+          ProjectionType: KEYS_ONLY
+        ProvisionedThroughput:
+          ReadCapacityUnits:
+            Ref: ReadCapacityUnits
+          WriteCapacityUnits:
+            Ref: WriteCapacityUnits
+      - IndexName: due_date_index
+        KeySchema:
+        - AttributeName: due_date
+          KeyType: HASH
+        Projection:
+          ProjectionType: KEYS_ONLY
+        ProvisionedThroughput:
+          ReadCapacityUnits:
+            Ref: ReadCapacityUnits
+          WriteCapacityUnits:
+            Ref: WriteCapacityUnits
+      KeySchema:
+      - AttributeName: invoice_id
+        KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits:
+          Ref: ReadCapacityUnits
+        WriteCapacityUnits:
+          Ref: WriteCapacityUnits
+      TableName:
+        Fn::Sub:
+        - ${AWS::StackName}-${TableNameSuffix}
+        - TableNameSuffix:
+            Ref: InvoicesTableNameSuffix
+  ScannedInvoicesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub:
+        - ${BucketNamePrefix}-${AWS::AccountId}
+        - BucketNamePrefix:
+            Ref: ScannedInvoicesBucketNamePrefix
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID: alias/aws/s3
+      VersioningConfiguration:
+        Status: Enabled
+  InvoiceAnalysesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub:
+        - ${BucketNamePrefix}-${AWS::AccountId}
+        - BucketNamePrefix:
+            Ref: InvoiceAnalysesBucketNamePrefix
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID: alias/aws/s3
+      VersioningConfiguration:
+        Status: Enabled
+  ProcessedInvoicesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub:
+        - ${BucketNamePrefix}-${AWS::AccountId}
+        - BucketNamePrefix:
+            Ref: ProcessedInvoicesBucketNamePrefix
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID: alias/aws/s3
+      VersioningConfiguration:
+        Status: Enabled
+  StartProcessScannedInvoiceWorkflowFunctionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambda_basic_execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub:
+              - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${LambdaFunctionName}:*
+              - LambdaFunctionName: StartProcessScannedInvoiceWorkflow
+      - PolicyName: sqs
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            - sqs:ReceiveMessage
+            Resource:
+              Fn::Sub:
+              - arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-${QueueName}
+              - QueueName: DocumentAnalysisCompletedQueue
+      - PolicyName: step_functions
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - states:StartExecution
+            Resource: '*'
+      - PolicyName: kms
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - kms:Decrypt
+            Resource: '*'
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${ExecutionRoleName}
+        - ExecutionRoleName: StartProcessScannedInvoiceWorkflowRole
+  StartProcessScannedInvoiceWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: StartProcessScannedInvoiceWorkflowFunction
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN:
+            Fn::Sub:
+            - arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-${StateMachineName}
+            - StateMachineName: ProcessScannedInvoiceWorkflow
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::Sub: ${DocumentAnalysisCompletedQueue.Arn}
+      FunctionName:
+        Fn::Sub:
+        - ${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: StartProcessScannedInvoiceWorkflow
+      Handler: app.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StartProcessScannedInvoiceWorkflowFunctionLambdaExecutionRole
+        - Arn
+      MemorySize: 128
+      Runtime: python3.8
+      Timeout: 30
+    Metadata:
+      SamResourceId: StartProcessScannedInvoiceWorkflowFunction
+  StartProcessScannedInvoiceWorkflowFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/lambda/${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: StartProcessScannedInvoiceWorkflow
+      RetentionInDays: 7
+  StartDocumentAnalysisFunctionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambda_basic_execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub:
+              - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${LambdaFunctionName}:*
+              - LambdaFunctionName: StartDocumentAnalysis
+      - PolicyName: s3
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: ScannedInvoicesBucketNamePrefix
+      - PolicyName: textract
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - textract:StartDocumentAnalysis
+            Resource: '*'
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${ExecutionRoleName}
+        - ExecutionRoleName: StartDocumentAnalysisRole
+  DocumentAnalysisCompletedTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId:
+        Ref: Key
+      TopicName:
+        Fn::Sub:
+        - ${AWS::StackName}-${TopicName}
+        - TopicName: DocumentAnalysisCompleted
+  DocumentAnalysisCompletedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 60
+      KmsMasterKeyId:
+        Ref: Key
+      QueueName:
+        Fn::Sub:
+        - ${AWS::StackName}-${QueueName}
+        - QueueName: DocumentAnalysisCompletedQueue
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 60
+  DocumentAnalysisCompletedQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: sns.amazonaws.com
+          Action:
+          - sqs:SendMessage
+          Resource:
+            Fn::Sub:
+            - arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-${QueueName}
+            - QueueName: DocumentAnalysisCompletedQueue
+      Queues:
+      - Ref: DocumentAnalysisCompletedQueue
+  DocumentAnalysisCompletedSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      Endpoint:
+        Fn::GetAtt:
+        - DocumentAnalysisCompletedQueue
+        - Arn
+      TopicArn:
+        Ref: DocumentAnalysisCompletedTopic
+  TextractPublishToSNSTopicRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - textract.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: sns
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource:
+              Fn::Sub:
+              - arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-${TopicName}
+              - TopicName: DocumentAnalysisCompleted
+      - PolicyName: kms
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - kms:GenerateDataKey*
+            - kms:Decrypt
+            Resource: '*'
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${RoleName}
+        - RoleName: TextractPublishToSNSTopicRole
+  StartDocumentAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: StartDocumentAnalysisFunction
+      Environment:
+        Variables:
+          DOCUMENT_ANALYIS_COMPLETED_SNS_TOPIC_ARN:
+            Fn::Sub:
+            - arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-${TopicName}
+            - TopicName: DocumentAnalysisCompleted
+          TEXTRACT_PUBLISH_TO_SNS_ROLE_ARN:
+            Fn::Sub:
+            - arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-${RoleName}
+            - RoleName: TextractPublishToSNSTopicRole
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket:
+              Ref: ScannedInvoicesBucket
+            Events: s3:ObjectCreated:*
+      FunctionName:
+        Fn::Sub:
+        - ${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: StartDocumentAnalysis
+      Handler: app.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StartDocumentAnalysisFunctionLambdaExecutionRole
+        - Arn
+      MemorySize: 128
+      Runtime: python3.8
+      Timeout: 30
+    Metadata:
+      SamResourceId: StartDocumentAnalysisFunction
+  StartDocumentAnalysisFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/lambda/${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: StartDocumentAnalysis
+      RetentionInDays: 7
+  SaveDocumentAnalysisFunctionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambda_basic_execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub:
+              - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${LambdaFunctionName}:*
+              - LambdaFunctionName: SaveDocumentAnalysis
+      - PolicyName: textract
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - textract:GetDocumentAnalysis
+            Resource: '*'
+      - PolicyName: s3
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: InvoiceAnalysesBucketNamePrefix
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${ExecutionRoleName}
+        - ExecutionRoleName: SaveDocumentAnalysisRole
+  SaveDocumentAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: SaveDocumentAnalysisFunction
+      Environment:
+        Variables:
+          ANALYSES_BUCKET_NAME:
+            Fn::Sub:
+            - ${BucketNamePrefix}-${AWS::AccountId}
+            - BucketNamePrefix:
+                Ref: InvoiceAnalysesBucketNamePrefix
+      FunctionName:
+        Fn::Sub:
+        - ${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: SaveDocumentAnalysis
+      Handler: app.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - SaveDocumentAnalysisFunctionLambdaExecutionRole
+        - Arn
+      MemorySize: 128
+      Runtime: python3.8
+      Timeout: 30
+    Metadata:
+      SamResourceId: SaveDocumentAnalysisFunction
+  SaveDocumentAnalysisFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/lambda/${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: SaveDocumentAnalysis
+      RetentionInDays: 7
+  PendingReviewTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId:
+        Ref: Key
+      TopicName:
+        Fn::Sub:
+        - ${AWS::StackName}-${TopicName}
+        - TopicName: PendingReview
+  ProcessDocumentAnalysisFunctionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambda_basic_execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub:
+              - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${LambdaFunctionName}:*
+              - LambdaFunctionName: ProcessDocumentAnalysis
+      - PolicyName: dynamodb
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:PutItem
+            Resource:
+              Fn::Sub:
+              - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-${TableNameSuffix}
+              - TableNameSuffix:
+                  Ref: InvoicesTableNameSuffix
+      - PolicyName: s3
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: InvoiceAnalysesBucketNamePrefix
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: ProcessedInvoicesBucketNamePrefix
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${ExecutionRoleName}
+        - ExecutionRoleName: ProcessDocumentAnalysisRole
+  ProcessDocumentAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ProcessDocumentAnalysisFunction
+      Environment:
+        Variables:
+          INVOICES_TABLE_NAME:
+            Fn::Sub:
+            - ${AWS::StackName}-${TableNameSuffix}
+            - TableNameSuffix:
+                Ref: InvoicesTableNameSuffix
+      FunctionName:
+        Fn::Sub:
+        - ${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: ProcessDocumentAnalysis
+      Handler: app.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - ProcessDocumentAnalysisFunctionLambdaExecutionRole
+        - Arn
+      MemorySize: 128
+      Runtime: python3.8
+      Timeout: 30
+    Metadata:
+      SamResourceId: ProcessDocumentAnalysisFunction
+  ProcessDocumentAnalysisFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/lambda/${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: ProcessDocumentAnalysis
+      RetentionInDays: 7
+  ArchiveDocumentFunctionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambda_basic_execution
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub:
+              - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${LambdaFunctionName}:*
+              - LambdaFunctionName: ArchiveDocument
+      - PolicyName: s3
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:GetObjectTagging
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: ScannedInvoicesBucketNamePrefix
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:PutObjectTagging
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: ProcessedInvoicesBucketNamePrefix
+          - Effect: Allow
+            Action:
+            - s3:DeleteObject
+            Resource:
+              Fn::Sub:
+              - arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}/*
+              - BucketNamePrefix:
+                  Ref: ScannedInvoicesBucketNamePrefix
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${ExecutionRoleName}
+        - ExecutionRoleName: ArchiveDocumentRole
+  ArchiveDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ArchiveDocumentFunction
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET_NAME:
+            Fn::Sub:
+            - ${BucketNamePrefix}-${AWS::AccountId}
+            - BucketNamePrefix:
+                Ref: ProcessedInvoicesBucketNamePrefix
+      FunctionName:
+        Fn::Sub:
+        - ${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: ArchiveDocument
+      Handler: app.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - ArchiveDocumentFunctionLambdaExecutionRole
+        - Arn
+      MemorySize: 128
+      Runtime: python3.8
+      Timeout: 30
+    Metadata:
+      SamResourceId: ArchiveDocumentFunction
+  ArchiveDocumentFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/lambda/${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: ArchiveDocument
+      RetentionInDays: 7
+  ProcessScannedInvoiceWorkflowStateMachineStatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - states.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: lambda_invoke
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - Fn::Sub:
+              - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${LambdaFunctionName}
+              - LambdaFunctionName: StartProcessScannedInvoiceWorkflow
+            - Fn::Sub:
+              - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${LambdaFunctionName}
+              - LambdaFunctionName: StartDocumentAnalysis
+            - Fn::Sub:
+              - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${LambdaFunctionName}
+              - LambdaFunctionName: GetDocumentAnalysisStatus
+            - Fn::Sub:
+              - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${LambdaFunctionName}
+              - LambdaFunctionName: SaveDocumentAnalysis
+            - Fn::Sub:
+              - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${LambdaFunctionName}
+              - LambdaFunctionName: ProcessDocumentAnalysis
+            - Fn::Sub:
+              - arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-${LambdaFunctionName}
+              - LambdaFunctionName: ArchiveDocument
+      - PolicyName: sns
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource:
+              Fn::Sub:
+              - arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-${TopicName}
+              - TopicName: PendingReview
+      - PolicyName: kms
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - kms:GenerateDataKey*
+            - kms:Decrypt
+            Resource: '*'
+      RoleName:
+        Fn::Sub:
+        - ${AWS::StackName}-${ExecutionRoleName}
+        - ExecutionRoleName: ProcessScannedInvoiceWorkflowRole
+  ProcessScannedInvoiceWorkflowStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionSubstitutions:
+        StartDocumentAnalysisLambdaArn:
+          Fn::GetAtt:
+          - StartDocumentAnalysisFunction
+          - Arn
+        SaveDocumentAnalysisLambdaArn:
+          Fn::GetAtt:
+          - SaveDocumentAnalysisFunction
+          - Arn
+        PendingReviewTopicArn:
+          Ref: PendingReviewTopic
+        ProcessDocumentAnalysisLambdaArn:
+          Fn::GetAtt:
+          - ProcessDocumentAnalysisFunction
+          - Arn
+        ArchiveDocumentLambdaArn:
+          Fn::GetAtt:
+          - ArchiveDocumentFunction
+          - Arn
+      DefinitionUri: ..\..\state_machine\process_scanned_invoice_workflow.asl.json
+      Role:
+        Fn::GetAtt:
+        - ProcessScannedInvoiceWorkflowStateMachineStatesExecutionRole
+        - Arn
+      Name:
+        Fn::Sub:
+        - ${AWS::StackName}-${LambdaFunctionName}
+        - LambdaFunctionName: ProcessScannedInvoiceWorkflow
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS:
+              Fn::Sub: arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+        - Effect: Allow
+          Principal:
+            Service:
+              Fn::Sub: textract.amazonaws.com
+          Action:
+          - kms:GenerateDataKey*
+          - kms:Decrypt
+          Resource: '*'
+        - Effect: Allow
+          Principal:
+            Service:
+              Fn::Sub: sns.amazonaws.com
+          Action:
+          - kms:GenerateDataKey*
+          - kms:Decrypt
+          Resource: '*'
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName:
+        Fn::Sub: alias/${AWS::StackName}-Key
+      TargetKeyId:
+        Ref: Key
+Outputs:
+  ScannedInvoicesBucketName:
+    Value:
+      Ref: ScannedInvoicesBucket
+  InvoiceAnalysesBucketName:
+    Value:
+      Ref: InvoiceAnalysesBucket
+  ProcessedInvoicesBucketName:
+    Value:
+      Ref: ProcessedInvoicesBucket
